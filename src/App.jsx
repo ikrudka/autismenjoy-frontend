@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
 
-const socket = io('http://localhost:3001');
+const socket = io('https://autismenjoy.onrender.com/');
 
 const COLOR_MAP = { red: 'text-red-600', black: 'text-gray-900', blue: 'text-blue-600', yellow: 'text-yellow-500', false: 'text-green-600' };
 const RACK_COLS = 15; 
