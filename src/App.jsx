@@ -1,13 +1,33 @@
 import React, { useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
 
-const socket = io('https://autismenjoy.onrender.com/');
+const SERVER_URL =
+  import.meta.env.VITE_SERVER_URL ||
+  import.meta.env.VITE_BACKEND_URL ||
+  'http://localhost:3001';
+
+const socket = io(SERVER_URL, {
+  transports: ['websocket', 'polling'],
+});
 
 const COLOR_MAP = { red: 'text-red-600', black: 'text-gray-900', blue: 'text-blue-600', yellow: 'text-yellow-500', false: 'text-green-600' };
 const RACK_COLS = 15; 
 const TURN_DURATION = 30000;
 
+const getOrCreatePlayerKey = () => {
+  try {
+    const existing = localStorage.getItem('okey_playerKey');
+    if (existing) return existing;
+    const key = (crypto?.randomUUID?.() || `${Date.now()}_${Math.random().toString(16).slice(2)}`);
+    localStorage.setItem('okey_playerKey', key);
+    return key;
+  } catch {
+    return `ephemeral_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  }
+};
+
 export default function App() {
+  const playerKey = getOrCreatePlayerKey();
   const [userName, setUserName] = useState('');
   const [roomInput, setRoomInput] = useState('');
   const [roomCode, setRoomCode] = useState('');
@@ -15,6 +35,8 @@ export default function App() {
   const [selectedTiles, setSelectedTiles] = useState([]);
   const [errorMsg, setErrorMsg] = useState('');
   const [timeProgress, setTimeProgress] = useState(100);
+  const [connState, setConnState] = useState(socket.connected ? 'connected' : 'connecting');
+  const [hoverTarget, setHoverTarget] = useState(null); // { playerId, groupIndex } | null
 
   useEffect(() => {
     socket.on('roomUpdate', (data) => {
@@ -36,7 +58,20 @@ export default function App() {
       setTimeout(() => setErrorMsg(''), 4000);
     });
 
-    return () => { socket.off('roomUpdate'); socket.off('error'); };
+    const onConnect = () => setConnState('connected');
+    const onDisconnect = () => setConnState('disconnected');
+    const onConnectError = () => setConnState('disconnected');
+    socket.on('connect', onConnect);
+    socket.on('disconnect', onDisconnect);
+    socket.on('connect_error', onConnectError);
+
+    return () => {
+      socket.off('roomUpdate');
+      socket.off('error');
+      socket.off('connect', onConnect);
+      socket.off('disconnect', onDisconnect);
+      socket.off('connect_error', onConnectError);
+    };
   }, []);
 
   useEffect(() => {
@@ -53,14 +88,14 @@ export default function App() {
     if (!userName.trim()) return setErrorMsg("İsim giriniz.");
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
     setRoomCode(code);
-    socket.emit('joinRoom', { roomCode: code, userName });
+    socket.emit('joinRoom', { roomCode: code, userName, playerKey });
   };
 
   const joinRoom = () => {
     if (!userName.trim() || !roomInput.trim()) return setErrorMsg("İsim ve Oda Kodu giriniz.");
     const code = roomInput.toUpperCase();
     setRoomCode(code);
-    socket.emit('joinRoom', { roomCode: code, userName });
+    socket.emit('joinRoom', { roomCode: code, userName, playerKey });
   };
 
   const startGame = () => socket.emit('startGame', roomCode);
@@ -89,6 +124,20 @@ export default function App() {
     if (!sourceData) return;
     socket.emit('processTile', { roomCode, sourceIndex: parseInt(sourceData, 10), targetPlayerId, groupIndex });
     setSelectedTiles([]);
+    setHoverTarget(null);
+  };
+
+  const tryProcessSelectedToGroup = (targetPlayerId, groupIndex) => {
+    if (!room?.hands?.[socket.id]) return;
+    if (!room?.hasOpened?.[socket.id]) return setErrorMsg('Önce barajı (101) aşmalısın.');
+    if (room?.players?.[room.turn]?.id !== socket.id) return setErrorMsg('Sıra sende değil!');
+    if (selectedTiles.length !== 1) return setErrorMsg('Taş işlemek için 1 taş seçmelisin.');
+    const tileId = selectedTiles[0];
+    const myHand = room.hands[socket.id];
+    const sourceIndex = myHand.findIndex(t => t && t.id === tileId);
+    if (sourceIndex === -1) return setErrorMsg('Seçtiğin taş ıstakada yok.');
+    socket.emit('processTile', { roomCode, sourceIndex, targetPlayerId, groupIndex });
+    setSelectedTiles([]);
   };
 
   const openToTable = () => {
@@ -96,6 +145,12 @@ export default function App() {
     let myHand = room.hands[socket.id];
     let groupToOpen = selectedTiles.map(id => myHand.find(t => t && t.id === id)).filter(Boolean);
     socket.emit('openToTable', { roomCode, openedGroup: groupToOpen });
+    setSelectedTiles([]);
+  };
+
+  const openDouble = () => {
+    if (selectedTiles.length < 2) return setErrorMsg("Çift açmak için taş seçmelisin!");
+    socket.emit('openDouble', { roomCode, selectedTileIds: selectedTiles });
     setSelectedTiles([]);
   };
 
@@ -108,6 +163,9 @@ export default function App() {
       <div className="min-h-screen bg-green-900 text-white flex items-center justify-center p-4">
         <div className="bg-green-800 p-8 rounded-xl shadow-2xl w-full max-w-md">
           <h1 className="text-4xl font-bold mb-8 text-center text-yellow-400">101 Okey</h1>
+          <div className="text-center text-xs mb-4 opacity-80">
+            Bağlantı: <b className={connState === 'connected' ? 'text-green-300' : connState === 'connecting' ? 'text-yellow-300' : 'text-red-300'}>{connState}</b>
+          </div>
           {!room ? (
             <>
               <input className="w-full p-3 mb-4 text-black rounded" placeholder="Adınız" value={userName} onChange={e => setUserName(e.target.value)} />
@@ -121,7 +179,14 @@ export default function App() {
             <div className="text-center">
               <h2 className="text-2xl mb-4">Oda: <span className="text-yellow-400 font-bold">{roomCode}</span></h2>
               <div className="bg-green-950 p-4 rounded mb-4">
-                {room.players.map((p, i) => <div key={i} className="py-1">{p.name}</div>)}
+                {room.players.map((p, i) => (
+                  <div key={i} className="py-1 flex items-center justify-between gap-3">
+                    <span className="truncate">{p.name}</span>
+                    <span className={`text-[10px] px-2 py-0.5 rounded-full ${p.connected === false ? 'bg-red-900/70 text-red-200' : 'bg-green-900/60 text-green-200'}`}>
+                      {p.connected === false ? 'offline' : 'online'}
+                    </span>
+                  </div>
+                ))}
               </div>
               {room.players[0].id === socket.id && <button onClick={startGame} className="w-full bg-yellow-600 p-3 rounded font-bold text-black">Başlat</button>}
             </div>
@@ -188,14 +253,25 @@ export default function App() {
       {topPlayer && (
         <div className="absolute top-2 left-1/2 -translate-x-1/2 flex flex-col items-center">
           <div className="relative mb-1">
-             <div className={`px-4 py-1 rounded-full ${room.players[room.turn].id === topPlayer.id ? 'bg-yellow-500 text-black font-bold' : 'bg-green-950'}`}>{topPlayer.name}</div>
+             <div className={`px-4 py-1 rounded-full flex items-center gap-2 ${room.players[room.turn].id === topPlayer.id ? 'bg-yellow-500 text-black font-bold' : 'bg-green-950'}`}>
+               <span className={`w-2 h-2 rounded-full ${topPlayer.connected === false ? 'bg-red-400' : 'bg-green-400'}`} />
+               <span>{topPlayer.name}</span>
+             </div>
              {room.players[room.turn].id === topPlayer.id && (
                 <div className="absolute -bottom-1 left-0 h-1 bg-red-500 rounded-full" style={{ width: `${timeProgress}%`, transition: 'width 0.1s linear' }} />
              )}
           </div>
           <div className="flex flex-wrap justify-center gap-1 bg-green-800/50 p-2 rounded-lg min-w-[200px] min-h-[50px] mb-1">
              {room.playerTables[topPlayer.id]?.map((g, i) => (
-                <div key={i} onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect="copy"; }} onDrop={(e) => handleDropOnTableGroup(e, topPlayer.id, i)} className="flex gap-0.5 bg-black/30 p-2 rounded hover:ring-2 hover:ring-blue-400 transition-all">
+                <div
+                  key={i}
+                  onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect="copy"; setHoverTarget({ playerId: topPlayer.id, groupIndex: i }); }}
+                  onDragLeave={() => setHoverTarget(null)}
+                  onDrop={(e) => handleDropOnTableGroup(e, topPlayer.id, i)}
+                  onClick={() => tryProcessSelectedToGroup(topPlayer.id, i)}
+                  className={`flex gap-0.5 bg-black/30 p-2 rounded transition-all ${hoverTarget?.playerId === topPlayer.id && hoverTarget?.groupIndex === i ? 'ring-2 ring-yellow-300 bg-blue-900/30' : 'hover:ring-2 hover:ring-blue-400'}`}
+                  title="Taş işlemek için taş seçip buraya dokun / sürükle"
+                >
                    <TileRow group={g} small isOkey={isOkey} />
                 </div>
              ))}
@@ -209,14 +285,25 @@ export default function App() {
       {leftPlayer && (
         <div className="absolute left-2 top-1/2 -translate-y-1/2 flex flex-row items-center gap-2">
           <div className="flex flex-col items-center relative">
-            <div className={`px-4 py-1 rounded-full mb-2 whitespace-nowrap ${room.players[room.turn].id === leftPlayer.id ? 'bg-yellow-500 text-black font-bold' : 'bg-green-950'}`}>{leftPlayer.name}</div>
+            <div className={`px-4 py-1 rounded-full mb-2 whitespace-nowrap flex items-center gap-2 ${room.players[room.turn].id === leftPlayer.id ? 'bg-yellow-500 text-black font-bold' : 'bg-green-950'}`}>
+              <span className={`w-2 h-2 rounded-full ${leftPlayer.connected === false ? 'bg-red-400' : 'bg-green-400'}`} />
+              <span>{leftPlayer.name}</span>
+            </div>
             {room.players[room.turn].id === leftPlayer.id && (
                <div className="absolute top-8 left-0 h-1 bg-red-500 rounded-full" style={{ width: `${timeProgress}%`, transition: 'width 0.1s linear' }} />
             )}
           </div>
           <div className="flex flex-col gap-1 bg-green-800/50 p-3 rounded-lg min-w-[80px] min-h-[120px]">
              {room.playerTables[leftPlayer.id]?.map((g, i) => (
-                <div key={i} onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect="copy"; }} onDrop={(e) => handleDropOnTableGroup(e, leftPlayer.id, i)} className="flex gap-0.5 bg-black/30 p-2 rounded hover:ring-2 hover:ring-blue-400 transition-all">
+                <div
+                  key={i}
+                  onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect="copy"; setHoverTarget({ playerId: leftPlayer.id, groupIndex: i }); }}
+                  onDragLeave={() => setHoverTarget(null)}
+                  onDrop={(e) => handleDropOnTableGroup(e, leftPlayer.id, i)}
+                  onClick={() => tryProcessSelectedToGroup(leftPlayer.id, i)}
+                  className={`flex gap-0.5 bg-black/30 p-2 rounded transition-all ${hoverTarget?.playerId === leftPlayer.id && hoverTarget?.groupIndex === i ? 'ring-2 ring-yellow-300 bg-blue-900/30' : 'hover:ring-2 hover:ring-blue-400'}`}
+                  title="Taş işlemek için taş seçip buraya dokun / sürükle"
+                >
                    <TileRow group={g} small isOkey={isOkey} />
                 </div>
              ))}
@@ -227,14 +314,25 @@ export default function App() {
       {rightPlayer && (
         <div className="absolute right-2 top-1/2 -translate-y-1/2 flex flex-row-reverse items-center gap-2">
           <div className="flex flex-col items-center relative">
-            <div className={`px-4 py-1 rounded-full mb-2 whitespace-nowrap ${room.players[room.turn].id === rightPlayer.id ? 'bg-yellow-500 text-black font-bold' : 'bg-green-950'}`}>{rightPlayer.name}</div>
+            <div className={`px-4 py-1 rounded-full mb-2 whitespace-nowrap flex items-center gap-2 ${room.players[room.turn].id === rightPlayer.id ? 'bg-yellow-500 text-black font-bold' : 'bg-green-950'}`}>
+              <span className={`w-2 h-2 rounded-full ${rightPlayer.connected === false ? 'bg-red-400' : 'bg-green-400'}`} />
+              <span>{rightPlayer.name}</span>
+            </div>
             {room.players[room.turn].id === rightPlayer.id && (
                <div className="absolute top-8 left-0 h-1 bg-red-500 rounded-full" style={{ width: `${timeProgress}%`, transition: 'width 0.1s linear' }} />
             )}
           </div>
           <div className="flex flex-col gap-1 bg-green-800/50 p-3 rounded-lg min-w-[80px] min-h-[120px]">
              {room.playerTables[rightPlayer.id]?.map((g, i) => (
-                <div key={i} onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect="copy"; }} onDrop={(e) => handleDropOnTableGroup(e, rightPlayer.id, i)} className="flex gap-0.5 bg-black/30 p-2 rounded hover:ring-2 hover:ring-blue-400 transition-all">
+                <div
+                  key={i}
+                  onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect="copy"; setHoverTarget({ playerId: rightPlayer.id, groupIndex: i }); }}
+                  onDragLeave={() => setHoverTarget(null)}
+                  onDrop={(e) => handleDropOnTableGroup(e, rightPlayer.id, i)}
+                  onClick={() => tryProcessSelectedToGroup(rightPlayer.id, i)}
+                  className={`flex gap-0.5 bg-black/30 p-2 rounded transition-all ${hoverTarget?.playerId === rightPlayer.id && hoverTarget?.groupIndex === i ? 'ring-2 ring-yellow-300 bg-blue-900/30' : 'hover:ring-2 hover:ring-blue-400'}`}
+                  title="Taş işlemek için taş seçip buraya dokun / sürükle"
+                >
                    <TileRow group={g} small isOkey={isOkey} />
                 </div>
              ))}
@@ -257,7 +355,23 @@ export default function App() {
         
         <div className="flex flex-wrap gap-2 bg-green-800/30 p-4 rounded-xl min-w-[300px] min-h-[70px] justify-center items-end border border-green-700/50">
           {room.playerTables[socket.id]?.map((group, i) => (
-             <div key={i} onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect="copy"; }} onDrop={(e) => handleDropOnTableGroup(e, socket.id, i)} onClick={() => takeBackGroup(i)} className="flex bg-black/40 p-2 rounded gap-1 cursor-pointer hover:bg-red-900/50 hover:ring-2 hover:ring-blue-400 transition-all" title="Geri Al / Taş İşle">
+             <div
+               key={i}
+               onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect="copy"; setHoverTarget({ playerId: socket.id, groupIndex: i }); }}
+               onDragLeave={() => setHoverTarget(null)}
+               onDrop={(e) => handleDropOnTableGroup(e, socket.id, i)}
+               onClick={() => {
+                 const isMyTurn = room?.players?.[room.turn]?.id === socket.id;
+                 if (!room.hasOpened?.[socket.id]) {
+                   // Geri alma sadece kendi sıranda anlamlı; aksi halde hata spam olmasın.
+                   if (isMyTurn) return takeBackGroup(i);
+                   return;
+                 }
+                 tryProcessSelectedToGroup(socket.id, i);
+               }}
+               className={`flex bg-black/40 p-2 rounded gap-1 transition-all ${hoverTarget?.playerId === socket.id && hoverTarget?.groupIndex === i ? 'ring-2 ring-yellow-300 bg-blue-900/30' : 'hover:ring-2 hover:ring-blue-400'} ${!room.hasOpened?.[socket.id] ? 'cursor-pointer hover:bg-red-900/50' : 'cursor-pointer'}`}
+               title={!room.hasOpened?.[socket.id] ? 'Geri Al / Taş İşle' : 'Taş işlemek için taş seçip buraya dokun / sürükle'}
+             >
                <TileRow group={group} small isOkey={isOkey} />
              </div>
           ))}
@@ -299,11 +413,17 @@ export default function App() {
 
               {errorMsg && <div className="text-red-300 font-bold bg-red-900/90 px-3 py-1 rounded text-sm shadow-lg absolute -top-12 left-1/2 -translate-x-1/2 z-50 whitespace-nowrap">{errorMsg}</div>}
               
-              <div className="flex gap-2">
+              <div className="flex gap-2 items-center">
                 <button onClick={openToTable} className="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded text-sm font-bold shadow">Per Aç</button>
+                <button onClick={openDouble} className="bg-purple-600 hover:bg-purple-500 text-white px-3 py-1.5 rounded text-sm font-bold shadow">Çift Aç</button>
                 <button onClick={sortMyHand} className="bg-[#3d2514] hover:bg-black text-white px-3 py-1.5 rounded text-sm font-bold shadow">Sırala</button>
               </div>
             </div>
+            {selectedTiles.length === 1 && room.hasOpened?.[socket.id] && (
+              <div className="mt-2 text-xs text-yellow-100/90">
+                Taş işlemek için bir pere dokunabilir veya sürükleyebilirsin.
+              </div>
+            )}
 
             <div className="overflow-x-auto no-scrollbar pb-1">
               <div className="grid gap-1 min-w-max" style={{ gridTemplateColumns: `repeat(${RACK_COLS}, 3.5rem)` }}>
