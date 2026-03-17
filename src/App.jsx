@@ -1,10 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
 
-const SERVER_URL =
-  import.meta.env.VITE_SERVER_URL ||
-  import.meta.env.VITE_BACKEND_URL ||
-  'http://localhost:3001';
+const SERVER_URL = 'https://autismenjoy.onrender.com';
 
 const socket = io(SERVER_URL, {
   transports: ['websocket', 'polling'],
